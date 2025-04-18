@@ -292,7 +292,7 @@ def download_video(url, format_id, language, download_path):
         # Optimize download settings
         ydl_opts = {
             'format': simple_format,
-            'outtmpl': os.path.join(download_path, f"%(title)s.%(ext)s"),
+            'outtmpl': os.path.join(download_path, f"{current_time}_%(title)s.%(ext)s"),
             'progress_hooks': [progress_hook],
             'quiet': False,
             'no_warnings': False,
