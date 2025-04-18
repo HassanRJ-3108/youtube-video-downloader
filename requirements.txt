@@ -1,0 +1,2 @@
+streamlit>=1.30.0        # UI framework for interactive apps
+yt-dlp>=2024.4.9      # Download videos from YouTube
