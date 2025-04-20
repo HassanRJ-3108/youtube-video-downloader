@@ -1,7 +1,12 @@
 import streamlit as st
 import yt_dlp
-import re
+import os
+import tempfile
 import time
+import re
+import base64
+import shutil
+from pathlib import Path
 
 # Page configuration
 st.set_page_config(
@@ -14,17 +19,20 @@ st.set_page_config(
 st.title("YouTube HD Downloader")
 st.write("Download videos in any quality (144p to 4K)")
 
+# Initialize session state
+if 'downloads' not in st.session_state:
+    st.session_state.downloads = {}
+
 # Input for YouTube URL
 youtube_url = st.text_input("Enter YouTube URL:", placeholder="https://www.youtube.com/watch?v=...")
 
-# Function to get ALL available formats with audio
-def get_all_formats(url):
+# Function to get video info
+def get_video_info(url):
     try:
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
             'skip_download': True,
-            'youtube_include_dash_manifest': False,  # Exclude DASH formats
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -32,6 +40,7 @@ def get_all_formats(url):
             
             # Get video details
             video_details = {
+                'id': info.get('id', 'unknown'),
                 'title': info.get('title', 'Unknown'),
                 'channel': info.get('uploader', 'Unknown'),
                 'duration': info.get('duration', 0),
@@ -39,89 +48,70 @@ def get_all_formats(url):
                 'thumbnail': info.get('thumbnail', ''),
             }
             
-            # Get all formats with both video and audio
-            combined_formats = []
-            for f in info.get('formats', []):
-                # Skip formats without url
-                if not f.get('url'):
-                    continue
-                
-                # Skip formats without extension
-                if not f.get('ext'):
-                    continue
-                
-                # Only include formats with both video and audio
-                if f.get('vcodec') != 'none' and f.get('acodec') != 'none':
-                    format_info = {
-                        'format_id': f.get('format_id', ''),
-                        'ext': f.get('ext', ''),
-                        'url': f.get('url', ''),
-                        'filesize': f.get('filesize', 0),
-                        'format_note': f.get('format_note', ''),
-                        'height': f.get('height', 0),
-                        'width': f.get('width', 0),
-                        'fps': f.get('fps', 0),
-                        'acodec': f.get('acodec', ''),
-                        'vcodec': f.get('vcodec', ''),
-                    }
-                    combined_formats.append(format_info)
+            # Create format options
+            formats = {}
             
-            # Get best audio-only format
-            audio_formats = []
-            for f in info.get('formats', []):
-                if f.get('vcodec') == 'none' and f.get('acodec') != 'none' and f.get('url'):
-                    audio_format = {
-                        'format_id': f.get('format_id', ''),
-                        'ext': f.get('ext', ''),
-                        'url': f.get('url', ''),
-                        'filesize': f.get('filesize', 0),
-                        'format_note': f.get('format_note', ''),
-                        'acodec': f.get('acodec', ''),
-                    }
-                    audio_formats.append(audio_format)
-            
-            # Sort audio formats by filesize (quality)
-            audio_formats.sort(key=lambda x: x.get('filesize', 0) or 0, reverse=True)
-            
-            # Get best audio format
-            best_audio = audio_formats[0] if audio_formats else None
-            
-            # Organize formats by resolution
-            resolution_groups = {}
-            
-            # Define resolution groups
+            # Add all resolution options
             resolutions = [
-                {"name": "4K (2160p)", "min_height": 2160, "max_height": 9999},
-                {"name": "2K (1440p)", "min_height": 1440, "max_height": 2159},
-                {"name": "1080p (Full HD)", "min_height": 1080, "max_height": 1439},
-                {"name": "720p (HD)", "min_height": 720, "max_height": 1079},
-                {"name": "480p", "min_height": 480, "max_height": 719},
-                {"name": "360p", "min_height": 360, "max_height": 479},
-                {"name": "240p", "min_height": 240, "max_height": 359},
-                {"name": "144p", "min_height": 1, "max_height": 239},
+                {"name": "4K (2160p)", "height": 2160},
+                {"name": "2K (1440p)", "height": 1440},
+                {"name": "1080p (Full HD)", "height": 1080},
+                {"name": "720p (HD)", "height": 720},
+                {"name": "480p", "height": 480},
+                {"name": "360p", "height": 360},
+                {"name": "240p", "height": 240},
+                {"name": "144p", "height": 144}
             ]
             
-            # Group formats by resolution
             for res in resolutions:
-                resolution_groups[res["name"]] = []
+                # Format string for this resolution
+                format_id = f"bestvideo[height<={res['height']}]+bestaudio/best[height<={res['height']}]"
                 
-                for fmt in combined_formats:
-                    height = fmt.get('height', 0)
-                    if height >= res["min_height"] and height <= res["max_height"]:
-                        resolution_groups[res["name"]].append(fmt)
+                # Check if this resolution is available
+                available = False
+                for f in info.get('formats', []):
+                    if f.get('height') == res['height'] or (f.get('height') and f.get('height') < res['height'] and not any(f.get('height') == r['height'] for r in resolutions if r['height'] < res['height'])):
+                        available = True
+                        break
+                
+                if available:
+                    formats[res["name"]] = {
+                        'format_id': format_id,
+                        'height': res['height'],
+                        'direct_url': None  # Will be filled if direct download is available
+                    }
             
-            # Sort formats within each resolution group by filesize (quality)
-            for res_name, formats in resolution_groups.items():
-                formats.sort(key=lambda x: x.get('filesize', 0) or 0, reverse=True)
+            # Check for direct download URLs (formats with both video and audio)
+            for f in info.get('formats', []):
+                if f.get('vcodec') != 'none' and f.get('acodec') != 'none' and f.get('url'):
+                    height = f.get('height', 0)
+                    for res in resolutions:
+                        if height == res['height']:
+                            if res['name'] in formats:
+                                formats[res['name']]['direct_url'] = f.get('url')
+                                formats[res['name']]['filesize'] = f.get('filesize', 0)
+                                formats[res['name']]['ext'] = f.get('ext', 'mp4')
             
-            # Remove empty resolution groups
-            resolution_groups = {k: v for k, v in resolution_groups.items() if v}
+            # Add audio-only option
+            audio_formats = [f for f in info.get('formats', []) if f.get('vcodec') == 'none' and f.get('acodec') != 'none']
+            if audio_formats:
+                # Sort by quality
+                audio_formats.sort(key=lambda x: x.get('filesize', 0) or 0, reverse=True)
+                best_audio = audio_formats[0]
+                
+                formats["Audio Only (MP3)"] = {
+                    'format_id': 'bestaudio/best',
+                    'height': 'Audio',
+                    'direct_url': best_audio.get('url'),
+                    'filesize': best_audio.get('filesize', 0),
+                    'ext': 'mp3'
+                }
             
-            return video_details, resolution_groups, best_audio
+            return video_details, formats
     
     except Exception as e:
         st.error(f"Error fetching video info: {str(e)}")
-        return None, None, None
+        return None, None
 
 # Format file size for display
 def format_size(size_bytes):
@@ -148,22 +138,127 @@ def format_duration(seconds):
     else:
         return f"{minutes}m {seconds}s"
 
-# Get Download Links button
-if st.button("Get Download Links"):
+# Function to download video
+def download_video(url, format_id, video_id, quality):
+    try:
+        # Create a temporary directory
+        temp_dir = tempfile.mkdtemp()
+        
+        # Progress indicators
+        progress_placeholder = st.empty()
+        progress_bar = progress_placeholder.progress(0)
+        status_text = st.empty()
+        
+        def progress_hook(d):
+            if d['status'] == 'downloading':
+                # Calculate progress
+                progress = 0
+                if 'total_bytes' in d and d['total_bytes'] > 0:
+                    progress = d['downloaded_bytes'] / d['total_bytes']
+                elif 'total_bytes_estimate' in d and d['total_bytes_estimate'] > 0:
+                    progress = d['downloaded_bytes'] / d['total_bytes_estimate']
+                
+                # Update progress bar
+                progress_bar.progress(min(progress, 1.0))
+                
+                # Update status text
+                percent = d.get('_percent_str', '0%').strip()
+                speed = d.get('_speed_str', '0 B/s').strip()
+                status_text.text(f"Downloading {quality}: {percent} at {speed}")
+            
+            elif d['status'] == 'finished':
+                progress_bar.progress(1.0)
+                status_text.text(f"Processing {quality} video... Almost done!")
+        
+        # Download settings
+        ydl_opts = {
+            'format': format_id,
+            'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
+            'progress_hooks': [progress_hook],
+            'quiet': False,
+            'no_warnings': False,
+            'noplaylist': True,
+        }
+        
+        # Add audio-only postprocessor if needed
+        if "bestaudio" in format_id and "bestvideo" not in format_id:
+            ydl_opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }]
+        else:
+            # For video, ensure we get mp4 output
+            ydl_opts['merge_output_format'] = 'mp4'
+            ydl_opts['postprocessors'] = [{
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4',
+            }]
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if info is None:
+                raise Exception("Failed to extract video information")
+                
+            filename = ydl.prepare_filename(info)
+            
+            # Ensure the extension is correct
+            if "bestaudio" in format_id and "bestvideo" not in format_id:
+                filename = os.path.splitext(filename)[0] + '.mp3'
+            else:
+                if not filename.endswith('.mp4'):
+                    filename = os.path.splitext(filename)[0] + '.mp4'
+            
+            # Find the downloaded file
+            final_path = os.path.join(temp_dir, os.path.basename(filename))
+            if not os.path.exists(final_path):
+                # Try to find the file with a similar name
+                for file in os.listdir(temp_dir):
+                    file_path = os.path.join(temp_dir, file)
+                    if os.path.isfile(file_path):
+                        final_path = file_path
+                        break
+            
+            # Read the file data
+            with open(final_path, 'rb') as f:
+                file_data = f.read()
+            
+            # Clean up
+            try:
+                shutil.rmtree(temp_dir)
+            except:
+                pass
+            
+            # Clear progress indicators
+            progress_placeholder.empty()
+            status_text.empty()
+            
+            return os.path.basename(final_path), file_data
+    
+    except Exception as e:
+        # Clean up
+        try:
+            shutil.rmtree(temp_dir)
+        except:
+            pass
+        
+        raise Exception(f"Download failed: {str(e)}")
+
+# Get Video Info button
+if st.button("Get Video Info"):
     if youtube_url:
         with st.spinner("Fetching video information..."):
             try:
                 start_time = time.time()
-                video_details, resolution_groups, best_audio = get_all_formats(youtube_url)
+                video_details, formats = get_video_info(youtube_url)
                 fetch_time = time.time() - start_time
                 
-                if video_details and resolution_groups:
+                if video_details and formats:
                     st.success(f"Video information fetched in {fetch_time:.2f} seconds")
                     
                     # Store in session state
                     st.session_state.video_details = video_details
-                    st.session_state.resolution_groups = resolution_groups
-                    st.session_state.best_audio = best_audio
+                    st.session_state.formats = formats
                 else:
                     st.error("Failed to fetch video information. Please check the URL and try again.")
             except Exception as e:
@@ -171,11 +266,10 @@ if st.button("Get Download Links"):
     else:
         st.error("Please enter a YouTube URL first")
 
-# Display video information and download links if available
-if 'video_details' in st.session_state and 'resolution_groups' in st.session_state:
+# Display video information and download options if available
+if 'video_details' in st.session_state and 'formats' in st.session_state:
     video_details = st.session_state.video_details
-    resolution_groups = st.session_state.resolution_groups
-    best_audio = st.session_state.best_audio
+    formats = st.session_state.formats
     
     # Display video information
     st.subheader(f"Video: {video_details['title']}")
@@ -194,8 +288,7 @@ if 'video_details' in st.session_state and 'resolution_groups' in st.session_sta
         st.write(f"**Views:** {video_details['views']:,}")
     
     # Display download options
-    st.subheader("Download Links")
-    st.write("�� Click any link below to download directly to your device")
+    st.subheader("Download Options")
     
     # Resolution order (highest to lowest)
     resolution_order = [
@@ -206,92 +299,104 @@ if 'video_details' in st.session_state and 'resolution_groups' in st.session_sta
         "480p", 
         "360p", 
         "240p", 
-        "144p"
+        "144p",
+        "Audio Only (MP3)"
     ]
     
-    # Display formats by resolution
-    for res_name in resolution_order:
-        if res_name in resolution_groups and resolution_groups[res_name]:
-            st.write(f"### {res_name}")
+    # Create columns for the table header
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        st.write("**Quality**")
+    with col2:
+        st.write("**Size**")
+    with col3:
+        st.write("**Download**")
+    
+    # Display formats in order
+    for res in resolution_order:
+        if res in formats:
+            format_info = formats[res]
             
-            # Display all formats in this resolution group
-            for i, format_info in enumerate(resolution_groups[res_name]):
-                col1, col2, col3 = st.columns([2, 1, 1])
-                
-                with col1:
-                    fps = format_info.get('fps', 0)
-                    ext = format_info.get('ext', 'mp4')
-                    format_note = format_info.get('format_note', '')
-                    
-                    details = []
-                    if fps:
-                        details.append(f"{fps} FPS")
-                    if format_note:
-                        details.append(format_note)
-                    
-                    details_str = f" ({', '.join(details)})" if details else ""
-                    st.write(f"**Option {i+1}**{details_str}")
-                
-                with col2:
-                    size = format_size(format_info.get('filesize', 0))
+            col1, col2, col3 = st.columns([2, 1, 1])
+            
+            with col1:
+                st.write(f"**{res}**")
+            
+            with col2:
+                if 'filesize' in format_info:
+                    size = format_size(format_info['filesize'])
                     st.write(f"{size}")
-                
-                with col3:
+                else:
+                    st.write("Size varies")
+            
+            with col3:
+                # Check if we have a direct download URL
+                if format_info.get('direct_url'):
                     # Create a direct download link
-                    download_url = format_info['url']
+                    download_url = format_info['direct_url']
+                    ext = format_info.get('ext', 'mp4')
                     
                     # Make the filename safe
                     safe_title = re.sub(r'[^\w\-_\. ]', '_', video_details['title'])
-                    filename = f"{safe_title} - {res_name}.{ext}"
+                    filename = f"{safe_title} - {res}.{ext}"
                     
                     # Use HTML to create a download link with filename
                     st.markdown(
-                        f'<a href="{download_url}" download="{filename}" target="_blank">Download {ext.upper()}</a>', 
+                        f'<a href="{download_url}" download="{filename}" target="_blank">Direct Download</a>', 
                         unsafe_allow_html=True
                     )
-    
-    # Display audio-only option
-    if best_audio:
-        st.write("### Audio Only (MP3)")
-        
-        col1, col2, col3 = st.columns([2, 1, 1])
-        
-        with col1:
-            format_note = best_audio.get('format_note', 'Best quality')
-            st.write(f"**Audio Only** ({format_note})")
-        
-        with col2:
-            size = format_size(best_audio.get('filesize', 0))
-            st.write(f"{size}")
-        
-        with col3:
-            # Create a direct download link
-            download_url = best_audio['url']
-            
-            # Make the filename safe
-            safe_title = re.sub(r'[^\w\-_\. ]', '_', video_details['title'])
-            filename = f"{safe_title} - Audio.{best_audio.get('ext', 'mp3')}"
-            
-            # Use HTML to create a download link with filename
-            st.markdown(
-                f'<a href="{download_url}" download="{filename}" target="_blank">Download MP3</a>', 
-                unsafe_allow_html=True
-            )
-    
-    # Add warning for high-resolution videos
-    if "4K (2160p)" in resolution_groups or "2K (1440p)" in resolution_groups:
-        st.warning("⚠️ **Note:** 4K and 2K videos may not play smoothly on some devices. VLC or a powerful media player is recommended.")
+                else:
+                    # Create a button to download via server
+                    download_key = f"{video_details['id']}_{res}"
+                    if st.button(f"Download {res}", key=download_key):
+                        try:
+                            with st.spinner(f"Processing {res} video..."):
+                                # Download the video
+                                filename, file_data = download_video(
+                                    youtube_url, 
+                                    format_info['format_id'], 
+                                    video_details['id'],
+                                    res
+                                )
+                                
+                                # Store the download
+                                st.session_state.downloads[download_key] = {
+                                    'filename': filename,
+                                    'data': file_data,
+                                    'quality': res
+                                }
+                                
+                                # Force refresh
+                                st.rerun()
+                        except Exception as e:
+                            st.error(f"Download failed: {str(e)}")
+                    
+                    # If download is complete, show download link
+                    if download_key in st.session_state.downloads:
+                        download_info = st.session_state.downloads[download_key]
+                        
+                        # Create a download link
+                        b64_data = base64.b64encode(download_info['data']).decode()
+                        
+                        # Make the filename safe
+                        safe_title = re.sub(r'[^\w\-_\. ]', '_', video_details['title'])
+                        ext = 'mp3' if res == "Audio Only (MP3)" else 'mp4'
+                        filename = f"{safe_title} - {res}.{ext}"
+                        
+                        # Create download link
+                        href = f'<a href="data:{"audio" if ext == "mp3" else "video"}/{ext};base64,{b64_data}" download="{filename}">Download {download_info["quality"]}</a>'
+                        st.markdown(href, unsafe_allow_html=True)
 
 # Instructions
 with st.expander("How to use"):
     st.write("""
     ### Instructions
     
-    1. Enter a YouTube URL and click "Get Download Links"
-    2. Wait for the video information to load
-    3. Choose your preferred quality (144p to 4K)
-    4. Click on any "Download" link to save directly to your device
-    5. The download will start immediately in your browser
+    1. Enter a YouTube URL and click "Get Video Info"
+    2. Choose your preferred quality (144p to 4K)
+    3. For some formats, you'll see a "Direct Download" link - click this to download directly
+    4. For other formats, click the "Download" button and wait for processing, then click the download link
+    5. The video will be saved to your device with audio included
     
     ### Quality Options
     
@@ -304,7 +409,7 @@ with st.expander("How to use"):
     
     ### Troubleshooting
     
-    - If a download link doesn't work, try a different option within the same resolution
+    - If a download fails, try a different quality option
     - Some videos may be restricted and cannot be downloaded
     - If you get an error, try again or try a different video
     - For high-resolution videos (2K/4K), use VLC Media Player for best playback
@@ -312,4 +417,4 @@ with st.expander("How to use"):
 
 # Footer
 st.markdown("---")
-st.caption("Made with Streamlit and yt-dlp • Click any Download link to save directly to your device")
+st.caption("Made with Streamlit and yt-dlp • All downloads include audio")
