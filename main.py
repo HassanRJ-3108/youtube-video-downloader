@@ -5,6 +5,9 @@ from pathlib import Path
 import re
 import time
 import datetime
+import base64
+import tempfile
+import shutil
 
 # Page configuration
 st.set_page_config(
@@ -15,7 +18,7 @@ st.set_page_config(
 
 # Header
 st.title("YouTube HD Downloader")
-st.write("Download high-quality videos with language selection")
+st.write("Download high-quality videos")
 
 # Initialize session state
 if 'download_started' not in st.session_state:
@@ -30,6 +33,8 @@ if 'filename' not in st.session_state:
     st.session_state.filename = None
 if 'video_info' not in st.session_state:
     st.session_state.video_info = None
+if 'download_data' not in st.session_state:
+    st.session_state.download_data = None
 
 # Input for YouTube URL
 youtube_url = st.text_input("Enter YouTube Video URL:", placeholder="https://www.youtube.com/watch?v=...")
@@ -41,7 +46,7 @@ def clean_ansi(text):
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
     return ansi_escape.sub('', text)
 
-# Function to get video info with languages
+# Function to get video info
 def get_video_info(url):
     try:
         ydl_opts = {
@@ -53,45 +58,19 @@ def get_video_info(url):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             
-            # Process languages
-            languages = {}
-            original_language = None
-            
-            # Check for multiple audio tracks
-            for fmt in info.get('formats', []):
-                if fmt.get('language'):
-                    lang_code = fmt.get('language')
-                    if lang_code and lang_code != 'none':
-                        # Try to get a proper language name
-                        lang_name = get_language_name(lang_code)
-                        
-                        # Mark original language
-                        if fmt.get('format_note') and 'original' in fmt.get('format_note').lower():
-                            lang_name += " (Original)"
-                            original_language = lang_code
-                        
-                        languages[lang_code] = lang_name
-            
-            # If we couldn't identify the original language, mark the first one
-            if not original_language and languages:
-                first_lang = next(iter(languages))
-                languages[first_lang] = languages[first_lang] + " (Original)"
-            
-            # If no languages found, add a default one
-            if not languages:
-                languages["original"] = "Original Audio"
-            
             # Create format options with sizes
             formats = {}
             
-            # Only add specific resolution options (removed "Best Quality" option)
+            # Add specific resolution options including lower resolutions
             resolutions = [
                 {"name": "2160p (4K)", "height": 2160},
                 {"name": "1440p (2K)", "height": 1440},
                 {"name": "1080p (Full HD)", "height": 1080},
                 {"name": "720p (HD)", "height": 720},
                 {"name": "480p", "height": 480},
-                {"name": "360p", "height": 360}
+                {"name": "360p", "height": 360},
+                {"name": "240p", "height": 240},
+                {"name": "144p", "height": 144}
             ]
             
             for res in resolutions:
@@ -118,8 +97,7 @@ def get_video_info(url):
                 'duration': info.get('duration', 0),
                 'views': info.get('view_count', 0),
                 'thumbnail': info.get('thumbnail', ''),
-                'formats': formats,
-                'languages': languages
+                'formats': formats
             }
     except Exception as e:
         st.error(f"Error fetching video info: {str(e)}")
@@ -205,8 +183,10 @@ def estimate_size(info, format_id, height=None, audio_only=False):
                 return duration * 5 * 1024 * 1024 / 60   # ~5MB per minute for 720p
             elif height >= 480:
                 return duration * 2.5 * 1024 * 1024 / 60 # ~2.5MB per minute for 480p
+            elif height >= 240:
+                return duration * 1.2 * 1024 * 1024 / 60 # ~1.2MB per minute for 240p
             else:
-                return duration * 1.5 * 1024 * 1024 / 60 # ~1.5MB per minute for 360p
+                return duration * 0.8 * 1024 * 1024 / 60 # ~0.8MB per minute for 144p
         else:
             # Default estimate: ~5MB per minute
             return duration * 5 * 1024 * 1024 / 60
@@ -226,9 +206,20 @@ def format_size(size_bytes):
     else:
         return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
 
+# Function to create a download link for a file
+def get_binary_file_downloader_html(bin_file, file_label='File'):
+    with open(bin_file, 'rb') as f:
+        data = f.read()
+    bin_str = base64.b64encode(data).decode()
+    href = f'<a href="data:application/octet-stream;base64,{bin_str}" download="{os.path.basename(bin_file)}">Download {file_label}</a>'
+    return href
+
 # Function to download video
-def download_video(url, format_id, language, download_path):
+def download_video(url, format_id):
     try:
+        # Create a temporary directory
+        temp_dir = tempfile.mkdtemp()
+        
         # Create progress indicators
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -260,9 +251,6 @@ def download_video(url, format_id, language, download_path):
                 progress_bar.progress(1.0)
                 status_text.text("Processing video... Almost done!")
         
-        # Ensure download path exists
-        os.makedirs(download_path, exist_ok=True)
-        
         # Generate a timestamp-based filename to ensure it appears at the top in file explorer
         current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         
@@ -285,14 +273,20 @@ def download_video(url, format_id, language, download_path):
         elif "480" in format_id:
             # For 480p
             simple_format = "bestvideo[height<=480]+bestaudio/best"
-        else:
-            # For 360p or fallback
+        elif "360" in format_id:
+            # For 360p
             simple_format = "bestvideo[height<=360]+bestaudio/best"
+        elif "240" in format_id:
+            # For 240p
+            simple_format = "bestvideo[height<=240]+bestaudio/best"
+        else:
+            # For 144p or fallback
+            simple_format = "bestvideo[height<=144]+bestaudio/best"
         
         # Optimize download settings
         ydl_opts = {
             'format': simple_format,
-            'outtmpl': os.path.join(download_path, f"{current_time}_%(title)s.%(ext)s"),
+            'outtmpl': os.path.join(temp_dir, f"{current_time}_%(title)s.%(ext)s"),
             'progress_hooks': [progress_hook],
             'quiet': False,
             'no_warnings': False,
@@ -315,9 +309,6 @@ def download_video(url, format_id, language, download_path):
                 'preferedformat': 'mp4',
             }]
         
-        # Simplified approach for language selection
-        # We'll just try to download the video and let yt-dlp handle the language selection
-        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:
                 info = ydl.extract_info(url, download=True)
@@ -333,14 +324,14 @@ def download_video(url, format_id, language, download_path):
                     if not filename.endswith('.mp4'):
                         filename = os.path.splitext(filename)[0] + '.mp4'
                 
-                # Check if file exists
-                final_path = os.path.join(download_path, os.path.basename(filename))
+                # Find the downloaded file
+                final_path = os.path.join(temp_dir, os.path.basename(filename))
                 if not os.path.exists(final_path):
                     # Try to find the file with a similar name
-                    base_name = os.path.splitext(os.path.basename(filename))[0]
-                    for file in os.listdir(download_path):
-                        if base_name in file:
-                            final_path = os.path.join(download_path, file)
+                    for file in os.listdir(temp_dir):
+                        file_path = os.path.join(temp_dir, file)
+                        if os.path.isfile(file_path):
+                            final_path = file_path
                             break
                 
                 return os.path.basename(final_path), final_path
@@ -361,12 +352,17 @@ def download_video(url, format_id, language, download_path):
                         if not filename.endswith('.mp4'):
                             filename = os.path.splitext(filename)[0] + '.mp4'
                         
-                        final_path = os.path.join(download_path, os.path.basename(filename))
+                        final_path = os.path.join(temp_dir, os.path.basename(filename))
                         return os.path.basename(final_path), final_path
                 else:
                     raise
     
     except Exception as e:
+        # Clean up temp directory
+        try:
+            shutil.rmtree(temp_dir)
+        except:
+            pass
         raise Exception(f"Download failed: {str(e)}")
 
 # Always show the "Fetch Video Info" button
@@ -427,57 +423,40 @@ if st.session_state.video_info:
     size_str = format_size(selected_format['size'])
     st.info(f"File size: **{size_str}**")
     
-    # Language selection if available
-    languages = video_info['languages']
-    if languages:
-        language_options = list(languages.keys())
-        language_display = {k: v for k, v in languages.items()}
+    # Download button - always visible
+    if st.button("Download Now", type="primary"):
+        st.session_state.download_started = True
+        st.session_state.download_complete = False
+        st.session_state.download_error = None
+        st.session_state.download_data = None
         
-        selected_language = st.selectbox(
-            "Select Language:", 
-            language_options,
-            format_func=lambda x: language_display[x]
-        )
-        
-        st.info(f"Selected audio track: **{language_display[selected_language]}**")
-        
-        # Add warning about language selection
-        if selected_language != "original":
-            st.warning("⚠️ Language selection may not work for all videos. If the selected language doesn't work, the video will use the original audio.")
-    else:
-        selected_language = "original"
-    
-    # Download location
-    download_path = str(Path.home() / "Downloads")
-    custom_path = st.checkbox("Specify custom download location")
-    if custom_path:
-        download_path = st.text_input("Download folder path:", value=download_path)
-        if not os.path.exists(download_path):
-            st.warning(f"The path '{download_path}' does not exist. It will be created when you download.")
-    
-    # Download button
-    if not st.session_state.download_started:
-        if st.button("Download Now", type="primary"):
-            st.session_state.download_started = True
-            st.session_state.download_complete = False
-            st.session_state.download_error = None
+        try:
+            # Start download with spinner
+            with st.spinner("Downloading video..."):
+                format_id = video_info['formats'][selected_quality]['format_id']
+                filename, filepath = download_video(youtube_url, format_id)
             
+            # Update session state
+            st.session_state.download_complete = True
+            st.session_state.filename = filename
+            st.session_state.download_path = filepath
+            
+            # Read the file data for download link
+            with open(filepath, 'rb') as f:
+                st.session_state.download_data = f.read()
+            
+            # Clean up the file
             try:
-                # Start download with spinner
-                with st.spinner("Downloading video..."):
-                    format_id = video_info['formats'][selected_quality]['format_id']
-                    filename, filepath = download_video(youtube_url, format_id, selected_language, download_path)
-                
-                # Update session state
-                st.session_state.download_complete = True
-                st.session_state.filename = filename
-                st.session_state.download_path = filepath
-            
-            except Exception as e:
-                st.session_state.download_error = str(e)
+                os.remove(filepath)
+                os.path.dirname(filepath) and shutil.rmtree(os.path.dirname(filepath), ignore_errors=True)
+            except:
+                pass
             
             # Force refresh
             st.rerun()
+        
+        except Exception as e:
+            st.session_state.download_error = str(e)
     
     # Show download status
     if st.session_state.download_started:
@@ -492,34 +471,26 @@ if st.session_state.video_info:
                 st.error("YouTube may have changed their system. Try updating yt-dlp.")
             elif "network" in error_msg or "connection" in error_msg:
                 st.error("Network error. Check your internet connection and try again.")
-            
-            if st.button("Try Again"):
-                st.session_state.download_started = False
-                st.rerun()
         
-        elif st.session_state.download_complete:
+        elif st.session_state.download_complete and st.session_state.download_data:
             st.success("✅ Download Complete!")
-            st.info(f"File saved as: {st.session_state.filename}")
-            st.info(f"Location: {st.session_state.download_path}")
             
-            # Check if file exists
-            if os.path.exists(st.session_state.download_path):
-                st.success("File verified - download successful!")
-                
-                # For high-resolution videos, add a playback tip
-                if selected_format['height'] in [1440, 2160]:
-                    st.warning("For smooth playback of high-resolution videos, use VLC Media Player or another powerful video player.")
-            else:
-                st.warning("File not found at the expected location. It may have been saved with a different name.")
+            # Create download link
+            file_ext = "mp3" if "Audio Only" in selected_quality else "mp4"
+            safe_title = re.sub(r'[^\w\-_\. ]', '_', video_info['title'])
+            download_filename = f"{safe_title}.{file_ext}"
             
-            if st.button("Download Another Video"):
-                st.session_state.download_started = False
-                st.session_state.download_complete = False
-                st.session_state.download_error = None
-                st.session_state.filename = None
-                st.session_state.download_path = None
-                st.session_state.video_info = None
-                st.rerun()
+            # Create a download button
+            st.download_button(
+                label="⬇️ Download File",
+                data=st.session_state.download_data,
+                file_name=download_filename,
+                mime="video/mp4" if file_ext == "mp4" else "audio/mp3"
+            )
+            
+            # For high-resolution videos, add a playback tip
+            if selected_format['height'] in [1440, 2160]:
+                st.warning("For smooth playback of high-resolution videos, use VLC Media Player or another powerful video player.")
 
 # Instructions
 with st.expander("How to use"):
@@ -528,10 +499,9 @@ with st.expander("How to use"):
     
     1. Enter a YouTube URL and click "Fetch Video Info"
     2. Select your preferred quality (up to 4K if available)
-    3. Select your preferred language (if multiple audio tracks are available)
-    4. Click "Download Now"
-    5. Wait for the download to complete
-    6. Find your video in your Downloads folder
+    3. Click "Download Now"
+    4. Wait for the download to complete
+    5. Click the "Download File" button to save the video to your device
     
     ### Quality Selection
     
@@ -539,13 +509,8 @@ with st.expander("How to use"):
     - **1080p (Full HD)** is recommended for most users - good quality and compatible with most devices
     - **720p (HD)** is a good balance of quality and file size
     - **480p** and **360p** are lower quality but smaller file size
+    - **240p** and **144p** are very low quality but smallest file size
     - **Audio Only (MP3)** will extract just the audio track
-    
-    ### Language Selection
-    
-    - If a video has multiple audio tracks (like dubbed versions), you can select your preferred language
-    - The language selection will only work if the video actually has multiple audio tracks
-    - Original language is marked with "(Original)"
     
     ### Troubleshooting
     
@@ -558,4 +523,4 @@ with st.expander("How to use"):
 
 # Footer
 st.markdown("---")
-st.caption("Made with Streamlit and yt-dlp • All downloads are saved to your Downloads folder")
+st.caption("Made with Streamlit and yt-dlp • Click the Download File button to save your video")
