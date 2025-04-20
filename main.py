@@ -8,6 +8,7 @@ import datetime
 import base64
 import tempfile
 import shutil
+import subprocess
 
 # Page configuration
 st.set_page_config(
@@ -74,7 +75,12 @@ def get_video_info(url):
             ]
             
             for res in resolutions:
-                format_id = f"bestvideo[height<={res['height']}]+bestaudio/best[height<={res['height']}]"
+                # For higher resolutions, we'll use a different approach
+                if res["height"] >= 720:
+                    format_id = f"bestvideo[height<={res['height']}]+bestaudio"
+                else:
+                    format_id = f"best[height<={res['height']}]"
+                
                 size = estimate_size(info, format_id, res['height'])
                 
                 formats[res["name"]] = {
@@ -85,7 +91,7 @@ def get_video_info(url):
             
             # Add audio-only option
             formats["Audio Only (MP3)"] = {
-                'format_id': 'bestaudio/best',
+                'format_id': 'bestaudio',
                 'size': estimate_size(info, 'bestaudio', 0, audio_only=True),
                 'height': 'Audio'
             }
@@ -102,63 +108,6 @@ def get_video_info(url):
     except Exception as e:
         st.error(f"Error fetching video info: {str(e)}")
         return None
-
-# Get proper language name
-def get_language_name(lang_code):
-    language_names = {
-        'en': 'English',
-        'es': 'Spanish',
-        'fr': 'French',
-        'de': 'German',
-        'it': 'Italian',
-        'pt': 'Portuguese',
-        'ru': 'Russian',
-        'ja': 'Japanese',
-        'ko': 'Korean',
-        'zh': 'Chinese',
-        'ar': 'Arabic',
-        'hi': 'Hindi',
-        'bn': 'Bengali',
-        'ur': 'Urdu',
-        'te': 'Telugu',
-        'mr': 'Marathi',
-        'ta': 'Tamil',
-        'gu': 'Gujarati',
-        'kn': 'Kannada',
-        'ml': 'Malayalam',
-        'pa': 'Punjabi',
-        'or': 'Odia',
-        'as': 'Assamese',
-        'mai': 'Maithili',
-        'ne': 'Nepali',
-        'sd': 'Sindhi',
-        'si': 'Sinhala',
-        'th': 'Thai',
-        'vi': 'Vietnamese',
-        'id': 'Indonesian',
-        'ms': 'Malay',
-        'tr': 'Turkish',
-        'fa': 'Persian',
-        'he': 'Hebrew',
-        'pl': 'Polish',
-        'nl': 'Dutch',
-        'sv': 'Swedish',
-        'da': 'Danish',
-        'no': 'Norwegian',
-        'fi': 'Finnish',
-        'hu': 'Hungarian',
-        'cs': 'Czech',
-        'sk': 'Slovak',
-        'ro': 'Romanian',
-        'bg': 'Bulgarian',
-        'hr': 'Croatian',
-        'sr': 'Serbian',
-        'uk': 'Ukrainian',
-        'el': 'Greek',
-        'original': 'Original'
-    }
-    # Return the language name if found, otherwise return the code
-    return language_names.get(lang_code, lang_code.upper())
 
 # Estimate file size based on resolution and duration
 def estimate_size(info, format_id, height=None, audio_only=False):
@@ -206,16 +155,8 @@ def format_size(size_bytes):
     else:
         return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
 
-# Function to create a download link for a file
-def get_binary_file_downloader_html(bin_file, file_label='File'):
-    with open(bin_file, 'rb') as f:
-        data = f.read()
-    bin_str = base64.b64encode(data).decode()
-    href = f'<a href="data:application/octet-stream;base64,{bin_str}" download="{os.path.basename(bin_file)}">Download {file_label}</a>'
-    return href
-
 # Function to download video
-def download_video(url, format_id):
+def download_video(url, format_id, quality):
     try:
         # Create a temporary directory
         temp_dir = tempfile.mkdtemp()
@@ -261,53 +202,25 @@ def download_video(url, format_id):
             
         # Prepare filename template with playlist index if needed
         if is_playlist:
-            filename_template = os.path.join(temp_dir, f"{current_time}_(%(playlist_index)s)_%(title)s.%(ext)s")
+            filename_template = os.path.join(temp_dir, f"{current_time}_(1)_%(title)s.%(ext)s")
         else:
             filename_template = os.path.join(temp_dir, f"{current_time}_%(title)s.%(ext)s")
         
-        # Optimize download settings
-        ydl_opts = {
-            'format': format_id,
-            'outtmpl': filename_template,
-            'progress_hooks': [progress_hook],
-            'quiet': False,
-            'no_warnings': False,
-            'noplaylist': not is_playlist,  # Download playlist if URL is a playlist
-            'ignoreerrors': True,  # Continue on download errors
-            'merge_output_format': 'mp4',  # Force MP4 output
-        }
-        
-        # Add audio-only postprocessor if needed
-        if "bestaudio" in format_id and "bestvideo" not in format_id:
-            ydl_opts['postprocessors'] = [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }]
-        else:
-            # For video, ensure we get mp4 output with audio
-            ydl_opts['postprocessors'] = [
-                {
-                    'key': 'FFmpegVideoConvertor',
-                    'preferedformat': 'mp4',
-                },
-                # Make sure audio is included
-                {
-                    'key': 'FFmpegEmbedSubtitle',
-                },
-            ]
+        # For audio-only downloads
+        if "Audio Only" in quality:
+            ydl_opts = {
+                'format': 'bestaudio',
+                'outtmpl': filename_template,
+                'progress_hooks': [progress_hook],
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+                'noplaylist': not is_playlist,
+            }
             
-            # Explicitly specify that we want both video and audio
-            if "bestvideo" in format_id and "bestaudio" in format_id:
-                pass  # Format already includes both
-            elif "bestvideo" in format_id:
-                ydl_opts['format'] = f"{format_id}/bestvideo+bestaudio/best"
-            else:
-                # Fallback to ensure we get both video and audio
-                ydl_opts['format'] = f"bestvideo+bestaudio/best"
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 if info is None:
                     raise Exception("Failed to extract video information")
@@ -324,11 +237,7 @@ def download_video(url, format_id):
                     filename = ydl.prepare_filename(info)
                 
                 # Ensure the extension is correct
-                if "bestaudio" in format_id and "bestvideo" not in format_id:
-                    filename = os.path.splitext(filename)[0] + '.mp3'
-                else:
-                    if not filename.endswith('.mp4'):
-                        filename = os.path.splitext(filename)[0] + '.mp4'
+                filename = os.path.splitext(filename)[0] + '.mp3'
                 
                 # Find the downloaded file
                 final_path = os.path.join(temp_dir, os.path.basename(filename))
@@ -336,42 +245,184 @@ def download_video(url, format_id):
                     # Try to find the file with a similar name
                     for file in os.listdir(temp_dir):
                         file_path = os.path.join(temp_dir, file)
-                        if os.path.isfile(file_path):
+                        if os.path.isfile(file_path) and file.endswith('.mp3'):
                             final_path = file_path
                             break
                 
                 return os.path.basename(final_path), final_path
-            except yt_dlp.utils.DownloadError as e:
-                error_message = str(e)
-                if "requested format not available" in error_message.lower():
-                    # If the requested format is not available, try a lower quality
-                    st.warning("Requested quality not available. Trying a lower quality...")
+        
+        # For video downloads
+        else:
+            # For higher resolutions (720p+), we need to download video and audio separately and merge
+            if "+" in format_id:  # This indicates separate video and audio streams
+                # First, get the video ID
+                video_id = None
+                if "youtube.com" in url or "youtu.be" in url:
+                    if "v=" in url:
+                        video_id = url.split("v=")[1].split("&")[0]
+                    elif "youtu.be/" in url:
+                        video_id = url.split("youtu.be/")[1].split("?")[0]
+                
+                if not video_id:
+                    raise Exception("Could not extract video ID from URL")
+                
+                # Get video and audio URLs
+                with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
+                    info = ydl.extract_info(url, download=False)
                     
-                    # Try with a more compatible format
-                    ydl_opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl2:
-                        info = ydl2.extract_info(url, download=True)
-                        if info is None:
-                            raise Exception("Failed to extract video information")
+                    # Find best video format for the requested quality
+                    video_formats = [f for f in info['formats'] if f.get('vcodec') != 'none' and f.get('acodec') == 'none']
+                    video_formats.sort(key=lambda x: (x.get('height', 0) or 0, x.get('filesize', 0) or 0), reverse=True)
+                    
+                    # Find the best video format that doesn't exceed our target height
+                    target_height = int(format_id.split("<=")[1].split("]")[0])
+                    selected_video_format = None
+                    for fmt in video_formats:
+                        if fmt.get('height', 0) and fmt.get('height') <= target_height:
+                            selected_video_format = fmt
+                            break
+                    
+                    if not selected_video_format and video_formats:
+                        selected_video_format = video_formats[-1]  # Fallback to lowest quality
+                    
+                    # Find best audio format
+                    audio_formats = [f for f in info['formats'] if f.get('vcodec') == 'none' and f.get('acodec') != 'none']
+                    audio_formats.sort(key=lambda x: x.get('filesize', 0) or 0, reverse=True)
+                    selected_audio_format = audio_formats[0] if audio_formats else None
+                    
+                    if not selected_video_format or not selected_audio_format:
+                        raise Exception("Could not find suitable video and audio formats")
+                    
+                    # Download video
+                    video_url = selected_video_format['url']
+                    video_ext = selected_video_format.get('ext', 'mp4')
+                    video_path = os.path.join(temp_dir, f"video.{video_ext}")
+                    
+                    status_text.text("Downloading video stream...")
+                    with open(video_path, 'wb') as f:
+                        response = yt_dlp.utils.urlopen(video_url)
+                        total_size = int(response.info().get('Content-Length', 0))
+                        downloaded = 0
+                        chunk_size = 1024 * 1024  # 1MB chunks
                         
-                        # Handle playlist vs single video differently
-                        if is_playlist and 'entries' in info:
-                            # For playlists, we'll just take the first successful download
-                            for entry in info['entries']:
-                                if entry:
-                                    filename = ydl2.prepare_filename(entry)
-                                    break
-                        else:
-                            # For single videos
-                            filename = ydl2.prepare_filename(info)
+                        while True:
+                            chunk = response.read(chunk_size)
+                            if not chunk:
+                                break
                             
-                        if not filename.endswith('.mp4'):
-                            filename = os.path.splitext(filename)[0] + '.mp4'
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            
+                            if total_size > 0:
+                                progress = downloaded / total_size
+                                progress_bar.progress(min(progress * 0.5, 0.5))  # Video is 50% of progress
+                                status_text.text(f"Downloading video: {downloaded / (1024 * 1024):.1f}MB / {total_size / (1024 * 1024):.1f}MB")
+                    
+                    # Download audio
+                    audio_url = selected_audio_format['url']
+                    audio_ext = selected_audio_format.get('ext', 'm4a')
+                    audio_path = os.path.join(temp_dir, f"audio.{audio_ext}")
+                    
+                    status_text.text("Downloading audio stream...")
+                    with open(audio_path, 'wb') as f:
+                        response = yt_dlp.utils.urlopen(audio_url)
+                        total_size = int(response.info().get('Content-Length', 0))
+                        downloaded = 0
+                        chunk_size = 1024 * 1024  # 1MB chunks
                         
-                        final_path = os.path.join(temp_dir, os.path.basename(filename))
-                        return os.path.basename(final_path), final_path
-                else:
-                    raise
+                        while True:
+                            chunk = response.read(chunk_size)
+                            if not chunk:
+                                break
+                            
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            
+                            if total_size > 0:
+                                progress = downloaded / total_size
+                                progress_bar.progress(min(0.5 + progress * 0.3, 0.8))  # Audio is 30% of progress
+                                status_text.text(f"Downloading audio: {downloaded / (1024 * 1024):.1f}MB / {total_size / (1024 * 1024):.1f}MB")
+                    
+                    # Merge video and audio
+                    status_text.text("Merging video and audio...")
+                    progress_bar.progress(0.8)
+                    
+                    # Get title for output filename
+                    title = info.get('title', 'video')
+                    safe_title = re.sub(r'[^\w\-_\. ]', '_', title)
+                    
+                    # Add playlist indicator if needed
+                    if is_playlist:
+                        output_filename = f"{current_time}_(1)_{safe_title}.mp4"
+                    else:
+                        output_filename = f"{current_time}_{safe_title}.mp4"
+                    
+                    output_path = os.path.join(temp_dir, output_filename)
+                    
+                    # Use FFmpeg to merge the files
+                    cmd = [
+                        'ffmpeg',
+                        '-i', video_path,
+                        '-i', audio_path,
+                        '-c:v', 'copy',
+                        '-c:a', 'aac',
+                        '-strict', 'experimental',
+                        output_path
+                    ]
+                    
+                    try:
+                        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    except subprocess.CalledProcessError as e:
+                        raise Exception(f"FFmpeg error: {e.stderr.decode()}")
+                    except FileNotFoundError:
+                        raise Exception("FFmpeg not found. Please install FFmpeg.")
+                    
+                    progress_bar.progress(1.0)
+                    status_text.text("Download complete!")
+                    
+                    return os.path.basename(output_path), output_path
+            
+            # For lower resolutions, we can use the standard approach
+            else:
+                ydl_opts = {
+                    'format': format_id,
+                    'outtmpl': filename_template,
+                    'progress_hooks': [progress_hook],
+                    'merge_output_format': 'mp4',
+                    'noplaylist': not is_playlist,
+                }
+                
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    if info is None:
+                        raise Exception("Failed to extract video information")
+                    
+                    # Handle playlist vs single video differently
+                    if is_playlist and 'entries' in info:
+                        # For playlists, we'll just take the first successful download
+                        for entry in info['entries']:
+                            if entry:
+                                filename = ydl.prepare_filename(entry)
+                                break
+                    else:
+                        # For single videos
+                        filename = ydl.prepare_filename(info)
+                    
+                    # Ensure the extension is correct
+                    if not filename.endswith('.mp4'):
+                        filename = os.path.splitext(filename)[0] + '.mp4'
+                    
+                    # Find the downloaded file
+                    final_path = os.path.join(temp_dir, os.path.basename(filename))
+                    if not os.path.exists(final_path):
+                        # Try to find the file with a similar name
+                        for file in os.listdir(temp_dir):
+                            file_path = os.path.join(temp_dir, file)
+                            if os.path.isfile(file_path) and file.endswith('.mp4'):
+                                final_path = file_path
+                                break
+                    
+                    return os.path.basename(final_path), final_path
     
     except Exception as e:
         # Clean up temp directory
@@ -455,7 +506,7 @@ if st.session_state.video_info:
             # Start download with spinner
             with st.spinner("Downloading video..."):
                 format_id = video_info['formats'][selected_quality]['format_id']
-                filename, filepath = download_video(youtube_url, format_id)
+                filename, filepath = download_video(youtube_url, format_id, selected_quality)
             
             # Update session state
             st.session_state.download_complete = True
@@ -492,6 +543,8 @@ if st.session_state.video_info:
                 st.error("YouTube may have changed their system. Try updating yt-dlp.")
             elif "network" in error_msg or "connection" in error_msg:
                 st.error("Network error. Check your internet connection and try again.")
+            elif "ffmpeg not found" in error_msg:
+                st.error("FFmpeg is required for high-quality downloads. Please contact the administrator to install FFmpeg.")
         
         elif st.session_state.download_complete and st.session_state.download_data:
             st.success("✅ Download Complete!")
@@ -533,7 +586,7 @@ with st.expander("How to use"):
     
     - **4K (2160p)** and **2K (1440p)** videos are very high quality but may not play smoothly on all devices
     - **1080p (Full HD)** is recommended for most users - good quality and compatible with most devices
-    - **720p (HD)** is a good balance of quality and file size
+    - **HD (720p)** is a good balance of quality and file size
     - **480p** and **360p** are lower quality but smaller file size
     - **240p** and **144p** are very low quality but smallest file size
     - **Audio Only (MP3)** will extract just the audio track
