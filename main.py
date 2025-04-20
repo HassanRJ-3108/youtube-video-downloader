@@ -9,6 +9,7 @@ import base64
 import tempfile
 import shutil
 import subprocess
+import urllib.request
 
 # Page configuration
 st.set_page_config(
@@ -253,134 +254,118 @@ def download_video(url, format_id, quality):
         
         # For video downloads
         else:
-            # For higher resolutions (720p+), we need to download video and audio separately and merge
+            # For higher resolutions (720p+), we need to use a special approach
             if "+" in format_id:  # This indicates separate video and audio streams
-                # First, get the video ID
-                video_id = None
-                if "youtube.com" in url or "youtu.be" in url:
-                    if "v=" in url:
-                        video_id = url.split("v=")[1].split("&")[0]
-                    elif "youtu.be/" in url:
-                        video_id = url.split("youtu.be/")[1].split("?")[0]
+                # We'll use yt-dlp's built-in functionality but with explicit settings
+                ydl_opts = {
+                    'format': format_id,
+                    'outtmpl': filename_template,
+                    'progress_hooks': [progress_hook],
+                    'merge_output_format': 'mp4',
+                    'noplaylist': not is_playlist,
+                    # Force FFmpeg to properly merge video and audio
+                    'postprocessors': [{
+                        'key': 'FFmpegVideoConvertor',
+                        'preferedformat': 'mp4',
+                    }],
+                    # Add extra FFmpeg arguments to ensure audio is included
+                    'postprocessor_args': {
+                        'FFmpegVideoConvertor': ['-c:v', 'copy', '-c:a', 'aac', '-strict', 'experimental'],
+                    },
+                }
                 
-                if not video_id:
-                    raise Exception("Could not extract video ID from URL")
-                
-                # Get video and audio URLs
-                with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
-                    info = ydl.extract_info(url, download=False)
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    if info is None:
+                        raise Exception("Failed to extract video information")
                     
-                    # Find best video format for the requested quality
-                    video_formats = [f for f in info['formats'] if f.get('vcodec') != 'none' and f.get('acodec') == 'none']
-                    video_formats.sort(key=lambda x: (x.get('height', 0) or 0, x.get('filesize', 0) or 0), reverse=True)
-                    
-                    # Find the best video format that doesn't exceed our target height
-                    target_height = int(format_id.split("<=")[1].split("]")[0])
-                    selected_video_format = None
-                    for fmt in video_formats:
-                        if fmt.get('height', 0) and fmt.get('height') <= target_height:
-                            selected_video_format = fmt
-                            break
-                    
-                    if not selected_video_format and video_formats:
-                        selected_video_format = video_formats[-1]  # Fallback to lowest quality
-                    
-                    # Find best audio format
-                    audio_formats = [f for f in info['formats'] if f.get('vcodec') == 'none' and f.get('acodec') != 'none']
-                    audio_formats.sort(key=lambda x: x.get('filesize', 0) or 0, reverse=True)
-                    selected_audio_format = audio_formats[0] if audio_formats else None
-                    
-                    if not selected_video_format or not selected_audio_format:
-                        raise Exception("Could not find suitable video and audio formats")
-                    
-                    # Download video
-                    video_url = selected_video_format['url']
-                    video_ext = selected_video_format.get('ext', 'mp4')
-                    video_path = os.path.join(temp_dir, f"video.{video_ext}")
-                    
-                    status_text.text("Downloading video stream...")
-                    with open(video_path, 'wb') as f:
-                        response = yt_dlp.utils.urlopen(video_url)
-                        total_size = int(response.info().get('Content-Length', 0))
-                        downloaded = 0
-                        chunk_size = 1024 * 1024  # 1MB chunks
-                        
-                        while True:
-                            chunk = response.read(chunk_size)
-                            if not chunk:
+                    # Handle playlist vs single video differently
+                    if is_playlist and 'entries' in info:
+                        # For playlists, we'll just take the first successful download
+                        for entry in info['entries']:
+                            if entry:
+                                filename = ydl.prepare_filename(entry)
                                 break
-                            
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            
-                            if total_size > 0:
-                                progress = downloaded / total_size
-                                progress_bar.progress(min(progress * 0.5, 0.5))  # Video is 50% of progress
-                                status_text.text(f"Downloading video: {downloaded / (1024 * 1024):.1f}MB / {total_size / (1024 * 1024):.1f}MB")
-                    
-                    # Download audio
-                    audio_url = selected_audio_format['url']
-                    audio_ext = selected_audio_format.get('ext', 'm4a')
-                    audio_path = os.path.join(temp_dir, f"audio.{audio_ext}")
-                    
-                    status_text.text("Downloading audio stream...")
-                    with open(audio_path, 'wb') as f:
-                        response = yt_dlp.utils.urlopen(audio_url)
-                        total_size = int(response.info().get('Content-Length', 0))
-                        downloaded = 0
-                        chunk_size = 1024 * 1024  # 1MB chunks
-                        
-                        while True:
-                            chunk = response.read(chunk_size)
-                            if not chunk:
-                                break
-                            
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            
-                            if total_size > 0:
-                                progress = downloaded / total_size
-                                progress_bar.progress(min(0.5 + progress * 0.3, 0.8))  # Audio is 30% of progress
-                                status_text.text(f"Downloading audio: {downloaded / (1024 * 1024):.1f}MB / {total_size / (1024 * 1024):.1f}MB")
-                    
-                    # Merge video and audio
-                    status_text.text("Merging video and audio...")
-                    progress_bar.progress(0.8)
-                    
-                    # Get title for output filename
-                    title = info.get('title', 'video')
-                    safe_title = re.sub(r'[^\w\-_\. ]', '_', title)
-                    
-                    # Add playlist indicator if needed
-                    if is_playlist:
-                        output_filename = f"{current_time}_(1)_{safe_title}.mp4"
                     else:
-                        output_filename = f"{current_time}_{safe_title}.mp4"
+                        # For single videos
+                        filename = ydl.prepare_filename(info)
                     
-                    output_path = os.path.join(temp_dir, output_filename)
+                    # Ensure the extension is correct
+                    if not filename.endswith('.mp4'):
+                        filename = os.path.splitext(filename)[0] + '.mp4'
                     
-                    # Use FFmpeg to merge the files
-                    cmd = [
-                        'ffmpeg',
-                        '-i', video_path,
-                        '-i', audio_path,
-                        '-c:v', 'copy',
-                        '-c:a', 'aac',
-                        '-strict', 'experimental',
-                        output_path
-                    ]
+                    # Find the downloaded file
+                    final_path = os.path.join(temp_dir, os.path.basename(filename))
+                    if not os.path.exists(final_path):
+                        # Try to find the file with a similar name
+                        for file in os.listdir(temp_dir):
+                            file_path = os.path.join(temp_dir, file)
+                            if os.path.isfile(file_path) and file.endswith('.mp4'):
+                                final_path = file_path
+                                break
                     
+                    # Verify that the file has audio
                     try:
-                        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    except subprocess.CalledProcessError as e:
-                        raise Exception(f"FFmpeg error: {e.stderr.decode()}")
-                    except FileNotFoundError:
-                        raise Exception("FFmpeg not found. Please install FFmpeg.")
+                        # Use FFprobe to check if the file has an audio stream
+                        cmd = [
+                            'ffprobe',
+                            '-v', 'error',
+                            '-select_streams', 'a:0',
+                            '-show_entries', 'stream=codec_type',
+                            '-of', 'default=noprint_wrappers=1:nokey=1',
+                            final_path
+                        ]
+                        
+                        result = subprocess.run(cmd, capture_output=True, text=True)
+                        
+                        if 'audio' not in result.stdout:
+                            # No audio stream found, try a different approach
+                            raise Exception("No audio stream found in the downloaded file")
+                    except:
+                        # If FFprobe check fails or no audio found, try a different approach
+                        # We'll download again with a different format string
+                        status_text.text("Retrying with a different method...")
+                        
+                        # Try a more compatible format string
+                        retry_ydl_opts = {
+                            'format': 'best',  # Use the best combined format
+                            'outtmpl': filename_template,
+                            'progress_hooks': [progress_hook],
+                            'merge_output_format': 'mp4',
+                            'noplaylist': not is_playlist,
+                        }
+                        
+                        with yt_dlp.YoutubeDL(retry_ydl_opts) as retry_ydl:
+                            info = retry_ydl.extract_info(url, download=True)
+                            if info is None:
+                                raise Exception("Failed to extract video information")
+                            
+                            # Handle playlist vs single video differently
+                            if is_playlist and 'entries' in info:
+                                # For playlists, we'll just take the first successful download
+                                for entry in info['entries']:
+                                    if entry:
+                                        filename = retry_ydl.prepare_filename(entry)
+                                        break
+                            else:
+                                # For single videos
+                                filename = retry_ydl.prepare_filename(info)
+                            
+                            # Ensure the extension is correct
+                            if not filename.endswith('.mp4'):
+                                filename = os.path.splitext(filename)[0] + '.mp4'
+                            
+                            # Find the downloaded file
+                            final_path = os.path.join(temp_dir, os.path.basename(filename))
+                            if not os.path.exists(final_path):
+                                # Try to find the file with a similar name
+                                for file in os.listdir(temp_dir):
+                                    file_path = os.path.join(temp_dir, file)
+                                    if os.path.isfile(file_path) and file.endswith('.mp4'):
+                                        final_path = file_path
+                                        break
                     
-                    progress_bar.progress(1.0)
-                    status_text.text("Download complete!")
-                    
-                    return os.path.basename(output_path), output_path
+                    return os.path.basename(final_path), final_path
             
             # For lower resolutions, we can use the standard approach
             else:
@@ -543,7 +528,7 @@ if st.session_state.video_info:
                 st.error("YouTube may have changed their system. Try updating yt-dlp.")
             elif "network" in error_msg or "connection" in error_msg:
                 st.error("Network error. Check your internet connection and try again.")
-            elif "ffmpeg not found" in error_msg:
+            elif "ffmpeg not found" in error_msg or "ffprobe" in error_msg:
                 st.error("FFmpeg is required for high-quality downloads. Please contact the administrator to install FFmpeg.")
         
         elif st.session_state.download_complete and st.session_state.download_data:
