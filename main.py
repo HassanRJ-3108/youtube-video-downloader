@@ -254,44 +254,27 @@ def download_video(url, format_id):
         # Generate a timestamp-based filename to ensure it appears at the top in file explorer
         current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        # Simplify the format selection to avoid errors
-        if "bestaudio" in format_id and "bestvideo" not in format_id:
-            # For audio only
-            simple_format = "bestaudio/best"
-        elif "2160" in format_id:
-            # For 4K
-            simple_format = "bestvideo[height<=2160]+bestaudio/best"
-        elif "1440" in format_id:
-            # For 2K
-            simple_format = "bestvideo[height<=1440]+bestaudio/best"
-        elif "1080" in format_id:
-            # For 1080p
-            simple_format = "bestvideo[height<=1080]+bestaudio/best"
-        elif "720" in format_id:
-            # For 720p
-            simple_format = "bestvideo[height<=720]+bestaudio/best"
-        elif "480" in format_id:
-            # For 480p
-            simple_format = "bestvideo[height<=480]+bestaudio/best"
-        elif "360" in format_id:
-            # For 360p
-            simple_format = "bestvideo[height<=360]+bestaudio/best"
-        elif "240" in format_id:
-            # For 240p
-            simple_format = "bestvideo[height<=240]+bestaudio/best"
+        # Determine if this is a playlist
+        is_playlist = False
+        if "playlist" in url.lower() or "&list=" in url:
+            is_playlist = True
+            
+        # Prepare filename template with playlist index if needed
+        if is_playlist:
+            filename_template = os.path.join(temp_dir, f"{current_time}_(%(playlist_index)s)_%(title)s.%(ext)s")
         else:
-            # For 144p or fallback
-            simple_format = "bestvideo[height<=144]+bestaudio/best"
+            filename_template = os.path.join(temp_dir, f"{current_time}_%(title)s.%(ext)s")
         
         # Optimize download settings
         ydl_opts = {
-            'format': simple_format,
-            'outtmpl': os.path.join(temp_dir, f"{current_time}_%(title)s.%(ext)s"),
+            'format': format_id,
+            'outtmpl': filename_template,
             'progress_hooks': [progress_hook],
             'quiet': False,
             'no_warnings': False,
-            'noplaylist': True,
+            'noplaylist': not is_playlist,  # Download playlist if URL is a playlist
             'ignoreerrors': True,  # Continue on download errors
+            'merge_output_format': 'mp4',  # Force MP4 output
         }
         
         # Add audio-only postprocessor if needed
@@ -302,20 +285,43 @@ def download_video(url, format_id):
                 'preferredquality': '192',
             }]
         else:
-            # For video, ensure we get mp4 output
-            ydl_opts['merge_output_format'] = 'mp4'
-            ydl_opts['postprocessors'] = [{
-                'key': 'FFmpegVideoConvertor',
-                'preferedformat': 'mp4',
-            }]
+            # For video, ensure we get mp4 output with audio
+            ydl_opts['postprocessors'] = [
+                {
+                    'key': 'FFmpegVideoConvertor',
+                    'preferedformat': 'mp4',
+                },
+                # Make sure audio is included
+                {
+                    'key': 'FFmpegEmbedSubtitle',
+                },
+            ]
+            
+            # Explicitly specify that we want both video and audio
+            if "bestvideo" in format_id and "bestaudio" in format_id:
+                pass  # Format already includes both
+            elif "bestvideo" in format_id:
+                ydl_opts['format'] = f"{format_id}/bestvideo+bestaudio/best"
+            else:
+                # Fallback to ensure we get both video and audio
+                ydl_opts['format'] = f"bestvideo+bestaudio/best"
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:
                 info = ydl.extract_info(url, download=True)
                 if info is None:
                     raise Exception("Failed to extract video information")
-                    
-                filename = ydl.prepare_filename(info)
+                
+                # Handle playlist vs single video differently
+                if is_playlist and 'entries' in info:
+                    # For playlists, we'll just take the first successful download
+                    for entry in info['entries']:
+                        if entry:
+                            filename = ydl.prepare_filename(entry)
+                            break
+                else:
+                    # For single videos
+                    filename = ydl.prepare_filename(info)
                 
                 # Ensure the extension is correct
                 if "bestaudio" in format_id and "bestvideo" not in format_id:
@@ -347,8 +353,18 @@ def download_video(url, format_id):
                         info = ydl2.extract_info(url, download=True)
                         if info is None:
                             raise Exception("Failed to extract video information")
+                        
+                        # Handle playlist vs single video differently
+                        if is_playlist and 'entries' in info:
+                            # For playlists, we'll just take the first successful download
+                            for entry in info['entries']:
+                                if entry:
+                                    filename = ydl2.prepare_filename(entry)
+                                    break
+                        else:
+                            # For single videos
+                            filename = ydl2.prepare_filename(info)
                             
-                        filename = ydl2.prepare_filename(info)
                         if not filename.endswith('.mp4'):
                             filename = os.path.splitext(filename)[0] + '.mp4'
                         
@@ -423,6 +439,11 @@ if st.session_state.video_info:
     size_str = format_size(selected_format['size'])
     st.info(f"File size: **{size_str}**")
     
+    # Check if URL is a playlist
+    is_playlist = "playlist" in youtube_url.lower() or "&list=" in youtube_url
+    if is_playlist:
+        st.info("📋 This appears to be a playlist. The first video will be downloaded.")
+    
     # Download button - always visible
     if st.button("Download Now", type="primary"):
         st.session_state.download_started = True
@@ -478,7 +499,12 @@ if st.session_state.video_info:
             # Create download link
             file_ext = "mp3" if "Audio Only" in selected_quality else "mp4"
             safe_title = re.sub(r'[^\w\-_\. ]', '_', video_info['title'])
-            download_filename = f"{safe_title}.{file_ext}"
+            
+            # Add (1) for playlist items
+            if is_playlist:
+                download_filename = f"{safe_title} (1).{file_ext}"
+            else:
+                download_filename = f"{safe_title}.{file_ext}"
             
             # Create a download button
             st.download_button(
