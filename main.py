@@ -9,7 +9,6 @@ import base64
 import tempfile
 import shutil
 import subprocess
-import urllib.request
 
 # Page configuration
 st.set_page_config(
@@ -37,6 +36,13 @@ if 'video_info' not in st.session_state:
     st.session_state.video_info = None
 if 'download_data' not in st.session_state:
     st.session_state.download_data = None
+if 'ffmpeg_available' not in st.session_state:
+    # Check if FFmpeg is available
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        st.session_state.ffmpeg_available = True
+    except (subprocess.SubprocessError, FileNotFoundError):
+        st.session_state.ffmpeg_available = False
 
 # Input for YouTube URL
 youtube_url = st.text_input("Enter YouTube Video URL:", placeholder="https://www.youtube.com/watch?v=...")
@@ -75,22 +81,45 @@ def get_video_info(url):
                 {"name": "144p", "height": 144}
             ]
             
-            for res in resolutions:
-                # For higher resolutions, we'll use a different approach
-                if res["height"] >= 720:
-                    format_id = f"bestvideo[height<={res['height']}]+bestaudio"
-                else:
+            # If FFmpeg is not available, we can't offer high-resolution options that require merging
+            if not st.session_state.ffmpeg_available:
+                # Only offer formats that don't require merging
+                for res in resolutions:
+                    # Use a format that doesn't require merging
                     format_id = f"best[height<={res['height']}]"
-                
-                size = estimate_size(info, format_id, res['height'])
-                
-                formats[res["name"]] = {
-                    'format_id': format_id,
-                    'size': size,
-                    'height': res['height']
-                }
+                    
+                    # Check if this format exists
+                    format_exists = False
+                    for fmt in info.get('formats', []):
+                        if fmt.get('height', 0) and fmt.get('height') <= res['height'] and fmt.get('acodec') != 'none':
+                            format_exists = True
+                            break
+                    
+                    if format_exists:
+                        size = estimate_size(info, format_id, res['height'])
+                        formats[res["name"]] = {
+                            'format_id': format_id,
+                            'size': size,
+                            'height': res['height']
+                        }
+            else:
+                # FFmpeg is available, offer all formats
+                for res in resolutions:
+                    # For higher resolutions, we'll use a different approach
+                    if res["height"] >= 720:
+                        format_id = f"bestvideo[height<={res['height']}]+bestaudio"
+                    else:
+                        format_id = f"best[height<={res['height']}]"
+                    
+                    size = estimate_size(info, format_id, res['height'])
+                    
+                    formats[res["name"]] = {
+                        'format_id': format_id,
+                        'size': size,
+                        'height': res['height']
+                    }
             
-            # Add audio-only option
+            # Add audio-only option (always available)
             formats["Audio Only (MP3)"] = {
                 'format_id': 'bestaudio',
                 'size': estimate_size(info, 'bestaudio', 0, audio_only=True),
@@ -209,15 +238,76 @@ def download_video(url, format_id, quality):
         
         # For audio-only downloads
         if "Audio Only" in quality:
+            # Check if FFmpeg is available for audio conversion
+            if st.session_state.ffmpeg_available:
+                ydl_opts = {
+                    'format': 'bestaudio',
+                    'outtmpl': filename_template,
+                    'progress_hooks': [progress_hook],
+                    'postprocessors': [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'mp3',
+                        'preferredquality': '192',
+                    }],
+                    'noplaylist': not is_playlist,
+                }
+            else:
+                # If FFmpeg is not available, just download the audio without conversion
+                ydl_opts = {
+                    'format': 'bestaudio',
+                    'outtmpl': filename_template,
+                    'progress_hooks': [progress_hook],
+                    'noplaylist': not is_playlist,
+                }
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if info is None:
+                    raise Exception("Failed to extract video information")
+                
+                # Handle playlist vs single video differently
+                if is_playlist and 'entries' in info:
+                    # For playlists, we'll just take the first successful download
+                    for entry in info['entries']:
+                        if entry:
+                            filename = ydl.prepare_filename(entry)
+                            break
+                else:
+                    # For single videos
+                    filename = ydl.prepare_filename(info)
+                
+                # Find the downloaded file
+                if st.session_state.ffmpeg_available:
+                    # If FFmpeg is available, the file should be an MP3
+                    filename = os.path.splitext(filename)[0] + '.mp3'
+                
+                final_path = os.path.join(temp_dir, os.path.basename(filename))
+                if not os.path.exists(final_path):
+                    # Try to find the file with a similar name
+                    for file in os.listdir(temp_dir):
+                        file_path = os.path.join(temp_dir, file)
+                        if os.path.isfile(file_path):
+                            final_path = file_path
+                            break
+                
+                return os.path.basename(final_path), final_path
+        
+        # For video downloads
+        else:
+            # Check if this format requires FFmpeg for merging
+            requires_ffmpeg = "+" in format_id
+            
+            # If format requires FFmpeg but it's not available, use a fallback format
+            if requires_ffmpeg and not st.session_state.ffmpeg_available:
+                # Use a format that doesn't require merging
+                format_id = f"best[height<={selected_format['height']}]"
+                status_text.text("FFmpeg not available. Using compatible format...")
+            
             ydl_opts = {
-                'format': 'bestaudio',
+                'format': format_id,
                 'outtmpl': filename_template,
                 'progress_hooks': [progress_hook],
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }],
+                'merge_output_format': 'mp4',
                 'noplaylist': not is_playlist,
             }
             
@@ -237,177 +327,17 @@ def download_video(url, format_id, quality):
                     # For single videos
                     filename = ydl.prepare_filename(info)
                 
-                # Ensure the extension is correct
-                filename = os.path.splitext(filename)[0] + '.mp3'
-                
                 # Find the downloaded file
                 final_path = os.path.join(temp_dir, os.path.basename(filename))
                 if not os.path.exists(final_path):
                     # Try to find the file with a similar name
                     for file in os.listdir(temp_dir):
                         file_path = os.path.join(temp_dir, file)
-                        if os.path.isfile(file_path) and file.endswith('.mp3'):
+                        if os.path.isfile(file_path):
                             final_path = file_path
                             break
                 
                 return os.path.basename(final_path), final_path
-        
-        # For video downloads
-        else:
-            # For higher resolutions (720p+), we need to use a special approach
-            if "+" in format_id:  # This indicates separate video and audio streams
-                # We'll use yt-dlp's built-in functionality but with explicit settings
-                ydl_opts = {
-                    'format': format_id,
-                    'outtmpl': filename_template,
-                    'progress_hooks': [progress_hook],
-                    'merge_output_format': 'mp4',
-                    'noplaylist': not is_playlist,
-                    # Force FFmpeg to properly merge video and audio
-                    'postprocessors': [{
-                        'key': 'FFmpegVideoConvertor',
-                        'preferedformat': 'mp4',
-                    }],
-                    # Add extra FFmpeg arguments to ensure audio is included
-                    'postprocessor_args': {
-                        'FFmpegVideoConvertor': ['-c:v', 'copy', '-c:a', 'aac', '-strict', 'experimental'],
-                    },
-                }
-                
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    if info is None:
-                        raise Exception("Failed to extract video information")
-                    
-                    # Handle playlist vs single video differently
-                    if is_playlist and 'entries' in info:
-                        # For playlists, we'll just take the first successful download
-                        for entry in info['entries']:
-                            if entry:
-                                filename = ydl.prepare_filename(entry)
-                                break
-                    else:
-                        # For single videos
-                        filename = ydl.prepare_filename(info)
-                    
-                    # Ensure the extension is correct
-                    if not filename.endswith('.mp4'):
-                        filename = os.path.splitext(filename)[0] + '.mp4'
-                    
-                    # Find the downloaded file
-                    final_path = os.path.join(temp_dir, os.path.basename(filename))
-                    if not os.path.exists(final_path):
-                        # Try to find the file with a similar name
-                        for file in os.listdir(temp_dir):
-                            file_path = os.path.join(temp_dir, file)
-                            if os.path.isfile(file_path) and file.endswith('.mp4'):
-                                final_path = file_path
-                                break
-                    
-                    # Verify that the file has audio
-                    try:
-                        # Use FFprobe to check if the file has an audio stream
-                        cmd = [
-                            'ffprobe',
-                            '-v', 'error',
-                            '-select_streams', 'a:0',
-                            '-show_entries', 'stream=codec_type',
-                            '-of', 'default=noprint_wrappers=1:nokey=1',
-                            final_path
-                        ]
-                        
-                        result = subprocess.run(cmd, capture_output=True, text=True)
-                        
-                        if 'audio' not in result.stdout:
-                            # No audio stream found, try a different approach
-                            raise Exception("No audio stream found in the downloaded file")
-                    except:
-                        # If FFprobe check fails or no audio found, try a different approach
-                        # We'll download again with a different format string
-                        status_text.text("Retrying with a different method...")
-                        
-                        # Try a more compatible format string
-                        retry_ydl_opts = {
-                            'format': 'best',  # Use the best combined format
-                            'outtmpl': filename_template,
-                            'progress_hooks': [progress_hook],
-                            'merge_output_format': 'mp4',
-                            'noplaylist': not is_playlist,
-                        }
-                        
-                        with yt_dlp.YoutubeDL(retry_ydl_opts) as retry_ydl:
-                            info = retry_ydl.extract_info(url, download=True)
-                            if info is None:
-                                raise Exception("Failed to extract video information")
-                            
-                            # Handle playlist vs single video differently
-                            if is_playlist and 'entries' in info:
-                                # For playlists, we'll just take the first successful download
-                                for entry in info['entries']:
-                                    if entry:
-                                        filename = retry_ydl.prepare_filename(entry)
-                                        break
-                            else:
-                                # For single videos
-                                filename = retry_ydl.prepare_filename(info)
-                            
-                            # Ensure the extension is correct
-                            if not filename.endswith('.mp4'):
-                                filename = os.path.splitext(filename)[0] + '.mp4'
-                            
-                            # Find the downloaded file
-                            final_path = os.path.join(temp_dir, os.path.basename(filename))
-                            if not os.path.exists(final_path):
-                                # Try to find the file with a similar name
-                                for file in os.listdir(temp_dir):
-                                    file_path = os.path.join(temp_dir, file)
-                                    if os.path.isfile(file_path) and file.endswith('.mp4'):
-                                        final_path = file_path
-                                        break
-                    
-                    return os.path.basename(final_path), final_path
-            
-            # For lower resolutions, we can use the standard approach
-            else:
-                ydl_opts = {
-                    'format': format_id,
-                    'outtmpl': filename_template,
-                    'progress_hooks': [progress_hook],
-                    'merge_output_format': 'mp4',
-                    'noplaylist': not is_playlist,
-                }
-                
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    if info is None:
-                        raise Exception("Failed to extract video information")
-                    
-                    # Handle playlist vs single video differently
-                    if is_playlist and 'entries' in info:
-                        # For playlists, we'll just take the first successful download
-                        for entry in info['entries']:
-                            if entry:
-                                filename = ydl.prepare_filename(entry)
-                                break
-                    else:
-                        # For single videos
-                        filename = ydl.prepare_filename(info)
-                    
-                    # Ensure the extension is correct
-                    if not filename.endswith('.mp4'):
-                        filename = os.path.splitext(filename)[0] + '.mp4'
-                    
-                    # Find the downloaded file
-                    final_path = os.path.join(temp_dir, os.path.basename(filename))
-                    if not os.path.exists(final_path):
-                        # Try to find the file with a similar name
-                        for file in os.listdir(temp_dir):
-                            file_path = os.path.join(temp_dir, file)
-                            if os.path.isfile(file_path) and file.endswith('.mp4'):
-                                final_path = file_path
-                                break
-                    
-                    return os.path.basename(final_path), final_path
     
     except Exception as e:
         # Clean up temp directory
@@ -416,6 +346,10 @@ def download_video(url, format_id, quality):
         except:
             pass
         raise Exception(f"Download failed: {str(e)}")
+
+# Show FFmpeg status
+if not st.session_state.ffmpeg_available:
+    st.warning("⚠️ FFmpeg is not installed. High-resolution videos (720p+) will be downloaded in a compatible format that may have lower quality.")
 
 # Always show the "Fetch Video Info" button
 if st.button("Fetch Video Info"):
@@ -466,8 +400,10 @@ if st.session_state.video_info:
     quality_options = list(video_info['formats'].keys())
     selected_quality = st.selectbox("Select Quality:", quality_options)
     
-    # Add warning for high-resolution videos
+    # Get the selected format
     selected_format = video_info['formats'][selected_quality]
+    
+    # Add warning for high-resolution videos
     if selected_format['height'] in [1440, 2160]:
         st.warning(f"⚠️ **Note:** {selected_quality} videos may not play smoothly on some devices due to high resolution. VLC or a powerful media player is recommended.")
     
@@ -528,14 +464,14 @@ if st.session_state.video_info:
                 st.error("YouTube may have changed their system. Try updating yt-dlp.")
             elif "network" in error_msg or "connection" in error_msg:
                 st.error("Network error. Check your internet connection and try again.")
-            elif "ffmpeg not found" in error_msg or "ffprobe" in error_msg:
-                st.error("FFmpeg is required for high-quality downloads. Please contact the administrator to install FFmpeg.")
+            elif "ffmpeg not found" in error_msg or "ffmpeg is not installed" in error_msg:
+                st.error("FFmpeg is required for high-quality downloads. Try selecting a lower quality option.")
         
         elif st.session_state.download_complete and st.session_state.download_data:
             st.success("✅ Download Complete!")
             
             # Create download link
-            file_ext = "mp3" if "Audio Only" in selected_quality else "mp4"
+            file_ext = "mp3" if "Audio Only" in selected_quality else os.path.splitext(st.session_state.filename)[1][1:]
             safe_title = re.sub(r'[^\w\-_\. ]', '_', video_info['title'])
             
             # Add (1) for playlist items
@@ -569,7 +505,7 @@ with st.expander("How to use"):
     
     ### Quality Selection
     
-    - **4K (2160p)** and **2K (1440p)** videos are very high quality but may not play smoothly on all devices
+    - **4K (2160p)** and **2K (1440p)** videos are very high quality but may not play smoothly on some devices
     - **1080p (Full HD)** is recommended for most users - good quality and compatible with most devices
     - **HD (720p)** is a good balance of quality and file size
     - **480p** and **360p** are lower quality but smaller file size
