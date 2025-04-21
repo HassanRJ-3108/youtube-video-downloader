@@ -81,33 +81,23 @@ def get_video_info(url):
                 {"name": "144p", "height": 144}
             ]
             
-            # If FFmpeg is not available, we can't offer high-resolution options that require merging
-            if not st.session_state.ffmpeg_available:
-                # Only offer formats that don't require merging
-                for res in resolutions:
-                    # Use a format that doesn't require merging
-                    format_id = f"best[height<={res['height']}]"
-                    
-                    # Check if this format exists
-                    format_exists = False
-                    for fmt in info.get('formats', []):
-                        if fmt.get('height', 0) and fmt.get('height') <= res['height'] and fmt.get('acodec') != 'none':
-                            format_exists = True
-                            break
-                    
-                    if format_exists:
-                        size = estimate_size(info, format_id, res['height'])
-                        formats[res["name"]] = {
-                            'format_id': format_id,
-                            'size': size,
-                            'height': res['height']
-                        }
-            else:
-                # FFmpeg is available, offer all formats
-                for res in resolutions:
+            # Always offer all resolutions
+            for res in resolutions:
+                # Check if this resolution is available
+                format_exists = False
+                for fmt in info.get('formats', []):
+                    if fmt.get('height', 0) == res['height']:
+                        format_exists = True
+                        break
+                
+                if format_exists:
                     # For higher resolutions, we'll use a different approach
                     if res["height"] >= 720:
-                        format_id = f"bestvideo[height<={res['height']}]+bestaudio"
+                        if st.session_state.ffmpeg_available:
+                            format_id = f"bestvideo[height<={res['height']}]+bestaudio"
+                        else:
+                            # When FFmpeg is not available, we'll download video and audio separately
+                            format_id = f"bestvideo[height<={res['height']}]"
                     else:
                         format_id = f"best[height<={res['height']}]"
                     
@@ -116,14 +106,16 @@ def get_video_info(url):
                     formats[res["name"]] = {
                         'format_id': format_id,
                         'size': size,
-                        'height': res['height']
+                        'height': res['height'],
+                        'needs_ffmpeg': res["height"] >= 720 and not st.session_state.ffmpeg_available
                     }
             
             # Add audio-only option (always available)
             formats["Audio Only (MP3)"] = {
                 'format_id': 'bestaudio',
                 'size': estimate_size(info, 'bestaudio', 0, audio_only=True),
-                'height': 'Audio'
+                'height': 'Audio',
+                'needs_ffmpeg': False
             }
             
             return {
@@ -186,7 +178,7 @@ def format_size(size_bytes):
         return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
 
 # Function to download video
-def download_video(url, format_id, quality):
+def download_video(url, format_id, quality, selected_format):
     try:
         # Create a temporary directory
         temp_dir = tempfile.mkdtemp()
@@ -294,50 +286,151 @@ def download_video(url, format_id, quality):
         
         # For video downloads
         else:
-            # Check if this format requires FFmpeg for merging
-            requires_ffmpeg = "+" in format_id
+            # Special handling for high-resolution videos without FFmpeg
+            if selected_format.get('needs_ffmpeg', False):
+                # We need to download video and audio separately
+                # First, get video info to find the best formats
+                with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    
+                    # Get the video title for the filename
+                    video_title = info.get('title', 'video')
+                    safe_title = re.sub(r'[^\w\-_\. ]', '_', video_title)
+                    
+                    # Find best video format for the requested quality
+                    video_formats = [f for f in info['formats'] if f.get('vcodec') != 'none' and f.get('height', 0) <= selected_format['height']]
+                    video_formats.sort(key=lambda x: (x.get('height', 0) or 0), reverse=True)
+                    
+                    if not video_formats:
+                        raise Exception(f"No suitable video format found for {quality}")
+                    
+                    selected_video_format = video_formats[0]
+                    
+                    # Download the video
+                    status_text.text(f"Downloading video stream ({selected_video_format.get('height', 0)}p)...")
+                    video_filename = f"{current_time}_{safe_title}_video.{selected_video_format.get('ext', 'mp4')}"
+                    video_path = os.path.join(temp_dir, video_filename)
+                    
+                    video_ydl_opts = {
+                        'format': f"{selected_video_format['format_id']}",
+                        'outtmpl': video_path,
+                        'progress_hooks': [progress_hook],
+                        'noplaylist': not is_playlist,
+                    }
+                    
+                    with yt_dlp.YoutubeDL(video_ydl_opts) as video_ydl:
+                        video_ydl.download([url])
+                    
+                    progress_bar.progress(0.5)
+                    
+                    # Find best audio format
+                    audio_formats = [f for f in info['formats'] if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
+                    audio_formats.sort(key=lambda x: x.get('abr', 0) or 0, reverse=True)
+                    
+                    if not audio_formats:
+                        # If no separate audio stream, use the best combined format
+                        combined_formats = [f for f in info['formats'] if f.get('acodec') != 'none' and f.get('vcodec') != 'none']
+                        combined_formats.sort(key=lambda x: (x.get('height', 0) or 0), reverse=True)
+                        
+                        if combined_formats:
+                            status_text.text("No separate audio stream found. Using combined format...")
+                            return os.path.basename(video_path), video_path
+                        else:
+                            raise Exception("No suitable audio format found")
+                    
+                    selected_audio_format = audio_formats[0]
+                    
+                    # Download the audio
+                    status_text.text("Downloading audio stream...")
+                    audio_filename = f"{current_time}_{safe_title}_audio.{selected_audio_format.get('ext', 'm4a')}"
+                    audio_path = os.path.join(temp_dir, audio_filename)
+                    
+                    audio_ydl_opts = {
+                        'format': f"{selected_audio_format['format_id']}",
+                        'outtmpl': audio_path,
+                        'progress_hooks': [progress_hook],
+                        'noplaylist': not is_playlist,
+                    }
+                    
+                    with yt_dlp.YoutubeDL(audio_ydl_opts) as audio_ydl:
+                        audio_ydl.download([url])
+                    
+                    progress_bar.progress(1.0)
+                    status_text.text("Download complete! You'll get both video and audio files.")
+                    
+                    # Create a ZIP file containing both video and audio
+                    import zipfile
+                    
+                    zip_path = os.path.join(temp_dir, f"{current_time}_{safe_title}.zip")
+                    with zipfile.ZipFile(zip_path, 'w') as zipf:
+                        zipf.write(video_path, os.path.basename(video_path))
+                        zipf.write(audio_path, os.path.basename(audio_path))
+                    
+                    # Add a README file explaining how to combine them
+                    readme_path = os.path.join(temp_dir, "README.txt")
+                    with open(readme_path, 'w') as f:
+                        f.write(f"""IMPORTANT: HOW TO PLAY THIS VIDEO WITH AUDIO
+
+This download contains two separate files:
+1. {os.path.basename(video_path)} - Video file (no audio)
+2. {os.path.basename(audio_path)} - Audio file
+
+To watch with audio, you have two options:
+
+OPTION 1: Use VLC Media Player
+1. Open VLC Media Player
+2. Go to Media > Open Multiple Files
+3. Add both the video and audio files
+4. Click Play
+
+OPTION 2: Combine the files using FFmpeg
+If you have FFmpeg installed, run this command:
+ffmpeg -i "{os.path.basename(video_path)}" -i "{os.path.basename(audio_path)}" -c:v copy -c:a aac -strict experimental "{safe_title}.mp4"
+
+Enjoy your video!
+""")
+                    
+                    zipf.write(readme_path, os.path.basename(readme_path))
+                    
+                    return os.path.basename(zip_path), zip_path
             
-            # If format requires FFmpeg but it's not available, use a fallback format
-            if requires_ffmpeg and not st.session_state.ffmpeg_available:
-                # Use a format that doesn't require merging
-                format_id = f"best[height<={selected_format['height']}]"
-                status_text.text("FFmpeg not available. Using compatible format...")
-            
-            ydl_opts = {
-                'format': format_id,
-                'outtmpl': filename_template,
-                'progress_hooks': [progress_hook],
-                'merge_output_format': 'mp4',
-                'noplaylist': not is_playlist,
-            }
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                if info is None:
-                    raise Exception("Failed to extract video information")
+            # Standard approach for formats that don't need special handling
+            else:
+                ydl_opts = {
+                    'format': format_id,
+                    'outtmpl': filename_template,
+                    'progress_hooks': [progress_hook],
+                    'merge_output_format': 'mp4',
+                    'noplaylist': not is_playlist,
+                }
                 
-                # Handle playlist vs single video differently
-                if is_playlist and 'entries' in info:
-                    # For playlists, we'll just take the first successful download
-                    for entry in info['entries']:
-                        if entry:
-                            filename = ydl.prepare_filename(entry)
-                            break
-                else:
-                    # For single videos
-                    filename = ydl.prepare_filename(info)
-                
-                # Find the downloaded file
-                final_path = os.path.join(temp_dir, os.path.basename(filename))
-                if not os.path.exists(final_path):
-                    # Try to find the file with a similar name
-                    for file in os.listdir(temp_dir):
-                        file_path = os.path.join(temp_dir, file)
-                        if os.path.isfile(file_path):
-                            final_path = file_path
-                            break
-                
-                return os.path.basename(final_path), final_path
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    if info is None:
+                        raise Exception("Failed to extract video information")
+                    
+                    # Handle playlist vs single video differently
+                    if is_playlist and 'entries' in info:
+                        # For playlists, we'll just take the first successful download
+                        for entry in info['entries']:
+                            if entry:
+                                filename = ydl.prepare_filename(entry)
+                                break
+                    else:
+                        # For single videos
+                        filename = ydl.prepare_filename(info)
+                    
+                    # Find the downloaded file
+                    final_path = os.path.join(temp_dir, os.path.basename(filename))
+                    if not os.path.exists(final_path):
+                        # Try to find the file with a similar name
+                        for file in os.listdir(temp_dir):
+                            file_path = os.path.join(temp_dir, file)
+                            if os.path.isfile(file_path):
+                                final_path = file_path
+                                break
+                    
+                    return os.path.basename(final_path), final_path
     
     except Exception as e:
         # Clean up temp directory
@@ -349,7 +442,7 @@ def download_video(url, format_id, quality):
 
 # Show FFmpeg status
 if not st.session_state.ffmpeg_available:
-    st.warning("⚠️ FFmpeg is not installed. High-resolution videos (720p+) will be downloaded in a compatible format that may have lower quality.")
+    st.info("ℹ️ FFmpeg is not installed on the server. High-resolution videos (720p+) will be downloaded as separate video and audio files that you can play together.")
 
 # Always show the "Fetch Video Info" button
 if st.button("Fetch Video Info"):
@@ -411,6 +504,10 @@ if st.session_state.video_info:
     size_str = format_size(selected_format['size'])
     st.info(f"File size: **{size_str}**")
     
+    # Special note for formats that need FFmpeg but it's not available
+    if selected_format.get('needs_ffmpeg', False):
+        st.info("📝 This quality will download as separate video and audio files in a ZIP archive. Instructions for playing them together will be included.")
+    
     # Check if URL is a playlist
     is_playlist = "playlist" in youtube_url.lower() or "&list=" in youtube_url
     if is_playlist:
@@ -427,7 +524,7 @@ if st.session_state.video_info:
             # Start download with spinner
             with st.spinner("Downloading video..."):
                 format_id = video_info['formats'][selected_quality]['format_id']
-                filename, filepath = download_video(youtube_url, format_id, selected_quality)
+                filename, filepath = download_video(youtube_url, format_id, selected_quality, selected_format)
             
             # Update session state
             st.session_state.download_complete = True
@@ -464,14 +561,16 @@ if st.session_state.video_info:
                 st.error("YouTube may have changed their system. Try updating yt-dlp.")
             elif "network" in error_msg or "connection" in error_msg:
                 st.error("Network error. Check your internet connection and try again.")
-            elif "ffmpeg not found" in error_msg or "ffmpeg is not installed" in error_msg:
-                st.error("FFmpeg is required for high-quality downloads. Try selecting a lower quality option.")
         
         elif st.session_state.download_complete and st.session_state.download_data:
             st.success("✅ Download Complete!")
             
-            # Create download link
-            file_ext = "mp3" if "Audio Only" in selected_quality else os.path.splitext(st.session_state.filename)[1][1:]
+            # Determine file extension and mime type
+            filename = st.session_state.filename
+            file_ext = os.path.splitext(filename)[1][1:] if '.' in filename else 'mp4'
+            mime_type = "application/zip" if file_ext == "zip" else f"video/{file_ext}" if file_ext != "mp3" else "audio/mp3"
+            
+            # Create a safe filename
             safe_title = re.sub(r'[^\w\-_\. ]', '_', video_info['title'])
             
             # Add (1) for playlist items
@@ -485,11 +584,21 @@ if st.session_state.video_info:
                 label="⬇️ Download File",
                 data=st.session_state.download_data,
                 file_name=download_filename,
-                mime="video/mp4" if file_ext == "mp4" else "audio/mp3"
+                mime=mime_type
             )
             
+            # Special instructions for ZIP files (separate video/audio)
+            if file_ext == "zip":
+                st.info("""
+                **Important: This download contains separate video and audio files**
+                
+                1. Extract the ZIP file after downloading
+                2. Read the included README.txt file for instructions
+                3. You can play both files together using VLC Media Player
+                """)
+            
             # For high-resolution videos, add a playback tip
-            if selected_format['height'] in [1440, 2160]:
+            elif selected_format['height'] in [1440, 2160]:
                 st.warning("For smooth playback of high-resolution videos, use VLC Media Player or another powerful video player.")
 
 # Instructions
@@ -505,12 +614,19 @@ with st.expander("How to use"):
     
     ### Quality Selection
     
-    - **4K (2160p)** and **2K (1440p)** videos are very high quality but may not play smoothly on some devices
+    - **4K (2160p)** and **2K (1440p)** videos are very high quality but may not play smoothly on all devices
     - **1080p (Full HD)** is recommended for most users - good quality and compatible with most devices
     - **HD (720p)** is a good balance of quality and file size
     - **480p** and **360p** are lower quality but smaller file size
     - **240p** and **144p** are very low quality but smallest file size
     - **Audio Only (MP3)** will extract just the audio track
+    
+    ### High-Resolution Downloads Without FFmpeg
+    
+    When downloading high-resolution videos (720p and above) without FFmpeg:
+    - You'll receive a ZIP file containing separate video and audio files
+    - Use VLC Media Player to play both files together
+    - Instructions are included in the ZIP file
     
     ### Troubleshooting
     
